@@ -4,6 +4,21 @@ const router = express.Router();
 const Post = require('../models/Post');
 const verifyToken=require('../verifyToken')
 
+// Middleware to update expired posts
+async function updatePostStatus(req, res, next) {
+    try {
+        await Post.updateMany(
+            { expirationTime: { $lte: Date.now() }, status: 'Live' },
+            { $set: { status: 'Expired' } }
+        );
+        next();
+    } catch (err) {
+        next(err);
+    }
+}
+
+// Apply the middleware to all routes in this router
+router.use('/', updatePostStatus);
 
 // POST (Create post) verifying token 
 router.post('/', verifyToken, async (req, res) => {
@@ -37,6 +52,7 @@ router.post('/', verifyToken, async (req, res) => {
     // Try to insert...
     try {
         const postToSave = await postData.save();
+        await postToSave.populate('user','username -_id');
         res.status(201).send(postToSave);
     } catch (err) {
         res.status(400).send({ message: err.message });
@@ -44,9 +60,9 @@ router.post('/', verifyToken, async (req, res) => {
 });
 
 // GET (Read all posts) verifying token
-router.get('/', verifyToken, async (req, res) => {
+router.get('/',  async (req, res) => {
     try {
-        const getPosts = await Post.find()
+        const getPosts = await Post.find({ status: 'Live' })
         .populate('user', 'username -_id') // Populate user field with the username. That way we dont only see posters id but username too.
         .populate('likedBy', 'username') // Replace 'likedBy' IDs with user details (username)
         .populate('dislikedBy', 'username') // Replace 'dislikedBy' IDs with user details (username)
@@ -60,7 +76,7 @@ router.get('/', verifyToken, async (req, res) => {
 // GET (Read post by ID)
 router.get('/:postId', verifyToken, async (req, res) => {
     try {
-        const getPostById = await Post.findById(req.params.postId)
+        const getPostById = await Post.findById({ _id: req.params.postId, status: 'Live' })
         .populate('user', 'username') // Populate user field with the username. That way we dont only see posters id but username too. these populate method makes sense when we are testing.
         .populate('likedBy', 'username') // Replace 'likedBy' IDs with user details (username)
         .populate('dislikedBy', 'username') // Replace 'dislikedBy' IDs with user details (username)
@@ -77,7 +93,12 @@ router.get('/:postId', verifyToken, async (req, res) => {
 // GET Posts by topic.
 router.get('/topic/:topic', verifyToken, async (req, res) => {
     try {
-        const postByTopic = await Post.find({topic:req.params.topic});
+        const postByTopic = await Post.find({topic: req.params.topic,status:'Live'})
+        .populate('user', 'username') // Populate user field with the username. That way we dont only see posters id but username too. these populate method makes sense when we are testing.
+        .populate('likedBy', 'username') // Replace 'likedBy' IDs with user details (username)
+        .populate('dislikedBy', 'username') // Replace 'dislikedBy' IDs with user details (username)
+        .populate('comments.user', 'username'); // Populate the user field in comments with username
+
         if (!postByTopic) {
             return res.status(404).send({ message: 'Topic not found' });
         }
@@ -90,9 +111,15 @@ router.get('/topic/:topic', verifyToken, async (req, res) => {
 // GET (Browse most active post by topic)
 router.get('/most-active/:topic', verifyToken, async (req, res) => {
     try {
-        const mostActivePost = await Post.find({ topic: req.params.topic })
+        const mostActivePost = await Post.find({ topic: req.params.topic, status: 'Live' })
             .sort({ likes: -1, dislikes: -1 })
-            .limit(1);
+            .limit(1)
+            .populate([
+                { path: 'user', select: 'username -_id' },
+                { path: 'likedBy', select: 'username -_id' },
+                { path: 'dislikedBy', select: 'username -_id' },
+                { path: 'comments.user', select: 'username -_id' }
+            ]);
         if (!mostActivePost || mostActivePost.length === 0) {
             return res.status(404).send({ message: 'There are no posts on this topic yet...' });
         }
@@ -138,19 +165,24 @@ router.patch('/:postId/like', verifyToken, async (req, res) => {
         if (!post || post.status === 'Expired') {
             return res.status(400).send({ message: 'Cannot interact with an expired post' });
         }
-        // Check if the post has expired
+        // Checking if the post has expired
         if (post.expirationTime && post.expirationTime <= Date.now()) {
             post.status = 'Expired';
             await post.save();
             return res.status(400).send({ message: 'Cannot interact with an expired post' });
+
+        }
+        // implementing users can not like their own posts function.
+        if (post.user.toString() === req.user._id.toString()) {
+            return res.status(400).send({ message:'Users can not like their own posts.' });
         }
         // If user has previously liked the post, remove like
         if (post.likedBy.includes(req.user._id)) {
             post.likedBy = post.likedBy.filter(userId => userId.toString() !== req.user._id.toString());
             post.likes -= 1;
         } else {
-            // If user has previously disliked the post, remove dislike
-          if (post.dislikedBy.includes(req.user._id)) {
+            // Remove dislike if its been disliked before.
+            if (post.dislikedBy.includes(req.user._id)) {
                 post.dislikedBy = post.dislikedBy.filter(userId => userId.toString() !== req.user._id.toString());
                 post.dislikes -= 1;
             }
@@ -160,6 +192,13 @@ router.patch('/:postId/like', verifyToken, async (req, res) => {
         }
         
         await post.save();
+        // Shows who liked or disliked the post to the user after liking.
+        await post.populate([
+            { path: 'user', select: 'username -_id' },
+            { path: 'likedBy', select: 'username -_id' },
+            { path: 'dislikedBy', select: 'username -_id' }
+        ]);
+
         res.status(200).send(post);
     } catch (err) {
         res.status(500).send({ message: err.message });
@@ -178,6 +217,9 @@ router.patch('/:postId/dislike', verifyToken, async (req, res) => {
             await post.save();
             return res.status(400).send({ message: 'Cannot interact with an expired post' });
         }
+        if (post.user.toString() === req.user._id.toString()) {
+            return res.status(400).send({ message: 'Users can not dislike their own posts' });
+        }
         // If user has previously disliked the post, remove dislike
         if (post.dislikedBy.includes(req.user._id)) {
             post.dislikedBy = post.dislikedBy.filter(userId => userId.toString() !== req.user._id.toString());
@@ -188,12 +230,18 @@ router.patch('/:postId/dislike', verifyToken, async (req, res) => {
                 post.likedBy = post.likedBy.filter(userId => userId.toString() !== req.user._id.toString());
                 post.likes -= 1;
             }
+            
             // Add dislike
             post.dislikedBy.push(req.user._id);
             post.dislikes += 1;
         }
         
         await post.save();
+        await post.populate([
+            { path: 'user', select: 'username -_id' },
+            { path: 'likedBy', select: 'username -_id' },
+            { path: 'dislikedBy', select: 'username -_id' }
+        ]);
         res.status(200).send(post);
     } catch (err) {
         res.status(500).send({ message: err.message });
@@ -220,6 +268,12 @@ router.post('/:postId/comment', verifyToken, async (req, res) => {
 
         post.comments.push(newComment);
         await post.save();
+        await post.populate([
+            { path: 'user', select: 'username -_id' },
+            { path: 'comments.user', select: 'username -_id' },
+            { path: 'likedBy', select: 'username -_id' },
+            { path: 'dislikedBy', select: 'username -_id' }
+        ]);
 
         res.status(201).send(post);
     } catch (err) {
